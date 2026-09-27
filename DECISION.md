@@ -89,6 +89,37 @@ its submitter -- not to whichever keeper happened to make the final, still-incon
 keeps the incentive honest: a keeper is only ever paid for producing an actual terminal verdict,
 never for exhausting a claim's retry budget.
 
+## Addendum: assertion-specific claim identity, and full bounty disposition on every terminal state
+
+Two issues found in review of the first draft, and how each is fixed:
+
+1. **A caller could permanently occupy a real `(chain, tx_hash)` pair.** The original `claim_id`
+   was just `f"{chain}:{tx}"`, so anyone could submit a claim about someone else's real transaction
+   with the wrong `expected_*` fields, get it resolved (typically REJECTED, since the real page
+   won't match the bogus fields), and permanently block the true submitter from ever registering
+   the correct assertion under that pair -- `self.claims` entries are never removed, and the old
+   `submit_claim` refused any id already present. The fix folds every asserted field into the id
+   (`_assertion_key`, length-prefixed then SHA-256'd to rule out cross-field collisions), so a
+   different set of expected fields for the same `(chain, tx_hash)` is simply a different claim
+   from the outset -- the true submitter is never blocked by someone else's differently-parameterized
+   claim about the same transaction.
+2. **A terminal claim could never be tried again, even legitimately.** Within one exact assertion,
+   the old design left a REJECTED or STALE record sitting in `self.claims` forever, with no way to
+   retry it (e.g. after a transient explorer outage caused an unlucky STALE, or a bug caused a
+   wrongful REJECTED). The fix tracks how many attempts an assertion has had
+   (`assertion_attempts`) and lets a fresh attempt begin once the assertion's current attempt is no
+   longer PENDING, always under a new `#N`-suffixed id rather than mutating the old one -- so a
+   CONFIRMED or REJECTED record stays permanently intact and readable at its original id for any
+   downstream consumer that cached it, while the assertion itself is never stuck.
+3. **Bounty above the keeper cap was unreachable on CONFIRMED/REJECTED.** The original
+   `_pay_keeper_if_affordable` paid the keeper up to `KEEPER_REWARD_CAP_WEI` and left any excess
+   sitting in `claim.bounty` with no further disposition -- `refund_stale_bounty` only ever fired
+   for STALE, so an oversized bounty's remainder on a CONFIRMED or REJECTED claim had no path out of
+   the contract. `refund_stale_bounty` is now `refund_remaining_bounty`, permissionless on any
+   `TERMINAL_STATUSES` member: the whole bounty for STALE (no keeper reward was ever paid), and
+   whatever remains above the capped keeper reward for CONFIRMED/REJECTED, both refundable to the
+   original submitter.
+
 ## Honest limitations, stated plainly rather than glossed over
 
 - **Rendering a public explorer page is not the same as querying its JSON API**, and several major
