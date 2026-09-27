@@ -14,12 +14,16 @@ wrapped-token mint on `is_confirmed(claim_id)` instead of trusting a single rela
 - **Source**: part of this repository, under `cross-chain-event-corroborator/`.
 - **Contract**: add StudioNet contract address here when deployed.
 - **Main workflow**: anyone calls `submit_claim(chain, event_type, tx_hash, ...)` with an optional
-  bounty -> any keeper calls `request_corroboration(claim_id)`, which asks a consensus round to
-  independently classify each fixed explorer's account of the transaction -> code aggregates those
-  classifications asymmetrically into CONFIRMED, REJECTED, or a retryable INSUFFICIENT -> a
-  terminal round pays its whole bounty to the keeper who triggered it; an unresolvable claim that
-  exhausts its attempt cap goes STALE and its bounty becomes refundable to the submitter via
-  `refund_stale_bounty`.
+  bounty -- the claim's id is derived from every asserted field, not just `(chain, tx_hash)`, so a
+  bogus-parameter claim about a real transaction can never occupy that transaction's slot for the
+  true submitter -- then any keeper calls `request_corroboration(claim_id)`, which asks a consensus
+  round to independently classify each fixed explorer's account of the transaction -> code
+  aggregates those classifications asymmetrically into CONFIRMED, REJECTED, or a retryable
+  INSUFFICIENT -> a terminal round pays a capped keeper reward out of the bounty; whatever remains
+  -- the whole bounty on a STALE claim, or the amount above the cap on a CONFIRMED/REJECTED one --
+  is refundable to the submitter via `refund_remaining_bounty`. The exact same assertion may be
+  resubmitted once its current attempt reaches any terminal state, always under a new, distinct id
+  so the original terminal record is never mutated.
 
 ## Why this is a genuine Intelligent Contract, not just an oracle relayer
 
@@ -66,10 +70,10 @@ be resubmitted once understood; nothing was moved on the strength of it. Concret
 
 | Method | Kind | Consensus round? | What it does |
 | --- | --- | --- | --- |
-| `submit_claim(chain, event_type, tx_hash, contract_address, expected_from, expected_to, expected_token_id, expected_amount)` | payable write, permissionless | No | Opens a new claim for a `(chain, tx_hash)` pair with an optional bounty. |
+| `submit_claim(chain, event_type, tx_hash, contract_address, expected_from, expected_to, expected_token_id, expected_amount)` | payable write, permissionless | No | Opens a new claim for this exact assertion (every field feeds the id, not just `chain`/`tx_hash`) with an optional bounty. Blocked only while an identical assertion is already PENDING; a prior attempt that reached CONFIRMED, REJECTED, or STALE never blocks a fresh one, which always gets its own distinct id. |
 | `add_bounty(claim_id)` | payable write, permissionless | No | Tops up a still-PENDING claim's bounty. |
 | `request_corroboration(claim_id)` | write, permissionless | **Yes -- once per attempt** | Runs a consensus round against fixed explorer sources; moves the claim to CONFIRMED, REJECTED, stays PENDING, or goes STALE once attempts are exhausted. |
-| `refund_stale_bounty(claim_id)` | write, permissionless | No | Refunds a STALE claim's remaining bounty to its original submitter. |
+| `refund_remaining_bounty(claim_id)` | write, permissionless | No | Refunds a terminal claim's remaining bounty (all of it for STALE; whatever is left above the keeper's capped reward for CONFIRMED/REJECTED) to its original submitter. |
 | `get_claim` / `is_confirmed` / `list_claims` | view | No | Reads -- the integration surface other contracts and integrators use. |
 
 ## Scope of this submission
