@@ -9,7 +9,8 @@ GEN = 10**18
 NOW = "2099-01-01T00:00:00Z"
 TX = "0x" + "ab" * 32           # well-formed 0x + 64 hex chars
 TX_2 = "0x" + "cd" * 32
-CLAIM_ID = f"ethereum:{TX}"
+ADDR_A = "0x" + "11" * 20
+ADDR_B = "0x" + "22" * 20
 
 ETHERSCAN_RE = r"https://etherscan\.io/tx/.*"
 BLOCKSCOUT_RE = r"https://eth\.blockscout\.com/tx/.*"
@@ -57,12 +58,26 @@ def mock_round(direct_vm, etherscan_ok=True, blockscout_ok=True, etherscan="MATC
     mock_verdict(direct_vm, etherscan=etherscan, blockscout=blockscout, reason=reason)
 
 
+def run_to_stale(contract, direct_vm, claim_id, sender, start=NOW):
+    """Drives a claim through MAX_CHECK_ATTEMPTS (5) inconclusive rounds so it goes STALE."""
+    t = start
+    direct_vm.sender = sender
+    result = None
+    for _ in range(5):
+        mock_round(direct_vm, etherscan="MATCH", blockscout="COULD_NOT_DETERMINE")
+        result = contract.request_corroboration(claim_id)
+        t = _iso_plus(t, 601)
+        warp_to(direct_vm, t)
+    return result, t
+
+
 # --- claim submission ---
 
 def test_submit_claim_creates_pending(contract, direct_vm, direct_bob):
     warp_to(direct_vm, NOW)
     claim_id = submit_claim(contract, direct_vm, direct_bob)
-    assert claim_id == CLAIM_ID
+    assert claim_id.startswith(f"ethereum:{TX}:")
+    assert claim_id.endswith("#0")
     c = contract.get_claim(claim_id)
     assert c["status"] == "PENDING"
     assert c["submitted_at"] == NOW
@@ -107,18 +122,84 @@ def test_submit_claim_accepts_empty_expected_fields(contract, direct_vm, direct_
     assert c["expected_amount"] == ""
 
 
-def test_submit_claim_duplicate_fails(contract, direct_vm, direct_bob, direct_carol):
+def test_submit_claim_normalizes_address_case(contract, direct_vm, direct_bob):
+    claim_id = submit_claim(contract, direct_vm, direct_bob, expected_from=ADDR_A.upper())
+    assert contract.get_claim(claim_id)["expected_from"] == ADDR_A.lower()
+
+
+def test_submit_claim_duplicate_fails_while_pending(contract, direct_vm, direct_bob, direct_carol):
+    """An identical, still-PENDING assertion cannot be submitted twice -- avoids redundant
+    concurrent claims splitting keeper effort and bounty for no reason."""
     submit_claim(contract, direct_vm, direct_bob)
     with pytest.raises(Exception):
         submit_claim(contract, direct_vm, direct_carol)
 
 
 def test_submit_claim_same_tx_different_chain_is_a_separate_claim(contract, direct_vm, direct_bob):
-    submit_claim(contract, direct_vm, direct_bob, chain="ethereum")
+    claim_id_1 = submit_claim(contract, direct_vm, direct_bob, chain="ethereum")
     claim_id_2 = submit_claim(contract, direct_vm, direct_bob, chain="polygon")
-    assert claim_id_2 == f"polygon:{TX}"
-    assert contract.get_claim(CLAIM_ID)["status"] == "PENDING"
+    assert claim_id_1 != claim_id_2
+    assert claim_id_2.startswith(f"polygon:{TX}:")
+    assert contract.get_claim(claim_id_1)["status"] == "PENDING"
     assert contract.get_claim(claim_id_2)["status"] == "PENDING"
+
+
+def test_submit_claim_same_pair_different_expected_fields_is_a_separate_claim(
+    contract, direct_vm, direct_bob, direct_carol
+):
+    """The core anti-griefing fix: a claim's identity is derived from every asserted field, not
+    just (chain, tx_hash). So a caller cannot 'occupy' a real transaction's slot for everyone else
+    by submitting a claim about it with the wrong expected fields -- the true submitter can still
+    register their own, differently-parameterized assertion about the exact same transaction as an
+    entirely independent, unblocked claim."""
+    honest_claim = submit_claim(contract, direct_vm, direct_bob, expected_from=ADDR_A)
+    grief_claim = submit_claim(contract, direct_vm, direct_carol, expected_from=ADDR_B)
+    assert honest_claim != grief_claim
+    assert contract.get_claim(honest_claim)["status"] == "PENDING"
+    assert contract.get_claim(honest_claim)["expected_from"] == ADDR_A.lower()
+    assert contract.get_claim(grief_claim)["status"] == "PENDING"
+    assert contract.get_claim(grief_claim)["expected_from"] == ADDR_B.lower()
+
+
+# --- resubmission after a terminal outcome ---
+
+def test_resubmit_after_stale_creates_a_new_distinct_id(contract, direct_vm, direct_bob, direct_dave):
+    """A terminal claim never blocks its own assertion from being tried again -- but re-submission
+    always lands on a fresh, distinct id rather than mutating the old terminal record, so the
+    original stays permanently readable at its own id for any downstream consumer that cached it."""
+    warp_to(direct_vm, NOW)
+    first_id = submit_claim(contract, direct_vm, direct_bob, value=2 * GEN)
+    _, t = run_to_stale(contract, direct_vm, first_id, direct_dave)
+    assert contract.get_claim(first_id)["status"] == "STALE"
+
+    warp_to(direct_vm, t)
+    second_id = submit_claim(contract, direct_vm, direct_bob, value=1 * GEN)
+    assert second_id != first_id
+    assert second_id == first_id.rsplit("#", 1)[0] + "#1"
+    assert contract.get_claim(second_id)["status"] == "PENDING"
+    # the old terminal record is untouched
+    assert contract.get_claim(first_id)["status"] == "STALE"
+    assert contract.get_claim(first_id)["bounty"] == str(2 * GEN)
+
+
+def test_resubmit_after_rejected_creates_a_new_distinct_id(contract, direct_vm, direct_bob, direct_dave):
+    warp_to(direct_vm, NOW)
+    first_id = submit_claim(contract, direct_vm, direct_bob)
+    mock_round(direct_vm, etherscan="NOT_FOUND", blockscout="MISMATCH")
+    direct_vm.sender = direct_dave
+    assert contract.request_corroboration(first_id) == "REJECTED"
+
+    second_id = submit_claim(contract, direct_vm, direct_bob)
+    assert second_id != first_id
+    assert contract.get_claim(second_id)["status"] == "PENDING"
+    assert contract.get_claim(first_id)["status"] == "REJECTED"
+
+
+def test_resubmit_while_still_pending_is_blocked(contract, direct_vm, direct_bob, direct_carol):
+    first_id = submit_claim(contract, direct_vm, direct_bob)
+    assert contract.get_claim(first_id)["status"] == "PENDING"
+    with pytest.raises(Exception):
+        submit_claim(contract, direct_vm, direct_carol)
 
 
 # --- bounty top-ups ---
@@ -144,7 +225,7 @@ def test_add_bounty_requires_existing_claim(contract, direct_vm, direct_bob):
     direct_vm.sender = direct_bob
     direct_vm.value = 1 * GEN
     with pytest.raises(Exception):
-        contract.add_bounty("ethereum:" + "00" * 32)
+        contract.add_bounty("ethereum:" + "00" * 32 + ":deadbeef#0")
     direct_vm.value = 0
 
 
@@ -215,7 +296,7 @@ def test_request_corroboration_requires_pending_status(contract, direct_vm, dire
 def test_request_corroboration_requires_existing_claim(contract, direct_vm, direct_dave):
     direct_vm.sender = direct_dave
     with pytest.raises(Exception):
-        contract.request_corroboration("ethereum:" + "11" * 32)
+        contract.request_corroboration("ethereum:" + "11" * 32 + ":deadbeef#0")
 
 
 # --- cooldown and retry ---
@@ -267,43 +348,78 @@ def test_request_corroboration_goes_stale_after_max_attempts(contract, direct_vm
     assert c["bounty"] == str(2 * GEN)  # untouched until refunded
 
 
-def test_refund_stale_bounty(contract, direct_vm, direct_bob, direct_carol, direct_dave):
+def test_refund_remaining_bounty_on_stale(contract, direct_vm, direct_bob, direct_carol, direct_dave):
     warp_to(direct_vm, NOW)
     claim_id = submit_claim(contract, direct_vm, direct_bob, value=2 * GEN)
-    t = NOW
-    direct_vm.sender = direct_dave
-    for _ in range(5):
-        mock_round(direct_vm, etherscan="MATCH", blockscout="COULD_NOT_DETERMINE")
-        contract.request_corroboration(claim_id)
-        t = _iso_plus(t, 601)
-        warp_to(direct_vm, t)
+    run_to_stale(contract, direct_vm, claim_id, direct_dave)
     assert contract.get_claim(claim_id)["status"] == "STALE"
 
     direct_vm.sender = direct_carol  # anyone may trigger the refund
-    contract.refund_stale_bounty(claim_id)
+    contract.refund_remaining_bounty(claim_id)
     assert contract.get_claim(claim_id)["bounty"] == "0"
 
 
-def test_refund_stale_bounty_requires_stale_status(contract, direct_vm, direct_bob, direct_carol):
+def test_refund_remaining_bounty_requires_terminal_status(contract, direct_vm, direct_bob, direct_carol):
     claim_id = submit_claim(contract, direct_vm, direct_bob, value=1 * GEN)
     direct_vm.sender = direct_carol
     with pytest.raises(Exception):
-        contract.refund_stale_bounty(claim_id)
+        contract.refund_remaining_bounty(claim_id)
 
 
-def test_refund_stale_bounty_rejects_double_refund(contract, direct_vm, direct_bob, direct_dave):
+def test_refund_remaining_bounty_rejects_double_refund(contract, direct_vm, direct_bob, direct_dave):
     warp_to(direct_vm, NOW)
     claim_id = submit_claim(contract, direct_vm, direct_bob, value=1 * GEN)
-    t = NOW
-    direct_vm.sender = direct_dave
-    for _ in range(5):
-        mock_round(direct_vm, etherscan="MATCH", blockscout="COULD_NOT_DETERMINE")
-        contract.request_corroboration(claim_id)
-        t = _iso_plus(t, 601)
-        warp_to(direct_vm, t)
-    contract.refund_stale_bounty(claim_id)
+    run_to_stale(contract, direct_vm, claim_id, direct_dave)
+    contract.refund_remaining_bounty(claim_id)
     with pytest.raises(Exception):
-        contract.refund_stale_bounty(claim_id)
+        contract.refund_remaining_bounty(claim_id)
+
+
+def test_refund_remaining_bounty_on_confirmed_reaches_excess_above_keeper_cap(
+    contract, direct_vm, direct_bob, direct_carol, direct_dave
+):
+    """A CONFIRMED verdict pays the keeper only up to KEEPER_REWARD_CAP_WEI; the remainder must
+    still be reachable -- refundable to the submitter -- rather than stuck in the contract."""
+    warp_to(direct_vm, NOW)
+    claim_id = submit_claim(contract, direct_vm, direct_bob, value=1 * GEN)  # well above the cap
+    mock_round(direct_vm, etherscan="MATCH", blockscout="MATCH")
+    direct_vm.sender = direct_dave
+    contract.request_corroboration(claim_id)
+    leftover = 1 * GEN - 5 * 10**15
+    assert int(contract.get_claim(claim_id)["bounty"]) == leftover
+
+    direct_vm.sender = direct_carol
+    contract.refund_remaining_bounty(claim_id)
+    assert contract.get_claim(claim_id)["bounty"] == "0"
+
+
+def test_refund_remaining_bounty_on_rejected_reaches_excess_above_keeper_cap(
+    contract, direct_vm, direct_bob, direct_carol, direct_dave
+):
+    warp_to(direct_vm, NOW)
+    claim_id = submit_claim(contract, direct_vm, direct_bob, value=1 * GEN)  # well above the cap
+    mock_round(direct_vm, etherscan="NOT_FOUND", blockscout="MISMATCH")
+    direct_vm.sender = direct_dave
+    contract.request_corroboration(claim_id)
+    leftover = 1 * GEN - 5 * 10**15
+    assert int(contract.get_claim(claim_id)["bounty"]) == leftover
+
+    direct_vm.sender = direct_carol
+    contract.refund_remaining_bounty(claim_id)
+    assert contract.get_claim(claim_id)["bounty"] == "0"
+
+
+def test_refund_remaining_bounty_rejects_when_nothing_left(contract, direct_vm, direct_bob, direct_dave):
+    """A small bounty fully absorbed by the keeper reward leaves nothing to refund."""
+    warp_to(direct_vm, NOW)
+    small_bounty = 10**12  # well under KEEPER_REWARD_CAP_WEI
+    claim_id = submit_claim(contract, direct_vm, direct_bob, value=small_bounty)
+    mock_round(direct_vm, etherscan="MATCH", blockscout="MATCH")
+    direct_vm.sender = direct_dave
+    contract.request_corroboration(claim_id)
+    assert contract.get_claim(claim_id)["bounty"] == "0"
+    with pytest.raises(Exception):
+        contract.refund_remaining_bounty(claim_id)
 
 
 # --- keeper reward ---
@@ -315,7 +431,8 @@ def test_keeper_reward_paid_on_confirmed(contract, direct_vm, direct_bob, direct
     direct_vm.sender = direct_dave
     contract.request_corroboration(claim_id)
     c = contract.get_claim(claim_id)
-    # KEEPER_REWARD_CAP_WEI = 5 * 10**15 is paid out of the 1 GEN bounty; the remainder stays.
+    # KEEPER_REWARD_CAP_WEI = 5 * 10**15 is paid out of the 1 GEN bounty; the remainder stays
+    # (and is reachable via refund_remaining_bounty -- see the dedicated tests above).
     assert int(c["bounty"]) == 1 * GEN - 5 * 10**15
 
 
@@ -344,9 +461,9 @@ def test_is_confirmed_false_before_corroboration(contract, direct_vm, direct_bob
 
 
 def test_is_confirmed_false_for_unknown_claim(contract, direct_vm):
-    assert contract.is_confirmed("ethereum:" + "99" * 32) is False
+    assert contract.is_confirmed("ethereum:" + "99" * 32 + ":deadbeef#0") is False
 
 
 def test_get_claim_requires_existing_claim(contract, direct_vm):
     with pytest.raises(Exception):
-        contract.get_claim("ethereum:" + "22" * 32)
+        contract.get_claim("ethereum:" + "22" * 32 + ":deadbeef#0")
