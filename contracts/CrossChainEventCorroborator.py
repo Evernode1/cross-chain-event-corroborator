@@ -2,6 +2,7 @@
 
 from genlayer import *
 from dataclasses import dataclass
+import hashlib
 import json
 
 ERROR_EXPECTED = "[EXPECTED]"
@@ -57,6 +58,22 @@ ERROR_LLM = "[LLM_ERROR]"
 # smaller MIN_SOURCES_REQUIRED to be fetchable and unanimously agree MISMATCH/NOT_FOUND. Any
 # COULD_NOT_DETERMINE anywhere, or any disagreement among fetchable sources, keeps the round
 # INSUFFICIENT rather than forcing a confident answer either way.
+# CLAIM IDENTITY IS ASSERTION-SPECIFIC, NOT JUST (chain, tx_hash): an id is derived from every
+# asserted field (event_type, contract_address, expected_from/to/token_id/amount), not merely the
+# pair a caller happens to name. Keying only on (chain, tx_hash) would let anyone permanently
+# occupy a real transaction's slot by submitting a claim with wrong expected fields first -- the
+# true submitter would then be locked out of ever registering the correct assertion under that
+# pair, since the wrong claim eventually resolves (REJECTED, or STALE after exhausting attempts)
+# and, in the old design, nothing ever cleared that slot for a different assertion afterward.
+# Folding the full assertion into the id means a different set of expected fields for the same
+# (chain, tx_hash) is simply a different claim from the start, coexisting independently. Within one
+# exact assertion, re-submission after ITS OWN prior attempt reaches a terminal state (CONFIRMED,
+# REJECTED, or STALE) is also allowed, but never by mutating the terminal record in place -- each
+# attempt gets its own distinct id (an incrementing `#N` suffix) so a settled fact, once CONFIRMED
+# or REJECTED, stays permanently readable at its original id for any downstream consumer that
+# cached it, while the assertion itself is never stuck unable to be tried again. Re-submission is
+# only blocked while the assertion's latest attempt is still PENDING (undecided), to avoid
+# redundant concurrent claims splitting keeper effort and bounty for no reason.
 # ---------------------------------------------------------------------------
 
 STATUS_PENDING = "PENDING"
@@ -101,15 +118,23 @@ CHAIN_EXPLORERS = {
 }
 SUPPORTED_CHAINS = tuple(CHAIN_EXPLORERS.keys())
 
+# A claim in any of these three statuses is done: no further consensus round will ever run against
+# it again under its own id (see `request_corroboration`'s PENDING-only guard). Whatever bounty
+# remains on it at that point -- the full amount for STALE, or the amount above the keeper's capped
+# reward for CONFIRMED/REJECTED -- is exactly what `refund_remaining_bounty` releases.
+TERMINAL_STATUSES = (STATUS_CONFIRMED, STATUS_REJECTED, STATUS_STALE)
+
 MIN_SOURCES_REQUIRED = 2          # floor for a REJECTED verdict; CONFIRMED needs ALL configured
 # sources for that chain, which is always >= this floor given the registry above.
 RECHECK_COOLDOWN_SECONDS = 600     # 10 minutes -- bounds non-determinism spam on retries.
 MAX_CHECK_ATTEMPTS = 5             # after this many INSUFFICIENT rounds, a claim goes STALE rather
 # than being retryable forever, and its bounty becomes refundable to the submitter.
-KEEPER_REWARD_CAP_WEI = 5 * 10**15  # a terminal round (CONFIRMED/REJECTED) pays the whole bounty
-# to whoever's transaction produced it, capped so an oversized bounty doesn't turn corroboration
-# into a race worth gaming; any excess above the cap simply stays with the claim and is NOT
-# refunded to the submitter on a terminal outcome (only a STALE claim's bounty is ever refunded).
+KEEPER_REWARD_CAP_WEI = 5 * 10**15  # a terminal round (CONFIRMED/REJECTED) pays the keeper whose
+# transaction produced it up to this much, capped so an oversized bounty doesn't turn corroboration
+# into a race worth gaming. ANY amount above the cap is never left stranded in the contract: it is
+# always reachable by the original submitter via `refund_remaining_bounty`, on every terminal
+# status (CONFIRMED and REJECTED, once the keeper's capped share is deducted, as well as STALE,
+# which never pays a keeper at all since no terminal verdict was actually produced).
 
 
 @allow_storage
@@ -150,13 +175,36 @@ class _Payee:
 class CrossChainEventCorroborator(gl.Contract):
     claim_ids: DynArray[str]
     claims: TreeMap[str, EventClaim]
+    # Number of submission attempts already made for a given assertion key (see `_assertion_key`).
+    # The next attempt's claim_id is `f"{assertion_key}#{attempts}"`; this is what lets a terminal
+    # attempt be safely followed by a fresh one without ever reusing or mutating the old id.
+    assertion_attempts: TreeMap[str, u256]
 
     def __init__(self):
         pass  # no admin -- see header; nothing here is a shared parameter one party could misuse
 
     # ------------------------------------------------------------------
-    # Submission -- permissionless, one open claim per (chain, tx_hash)
+    # Submission -- permissionless, one open (i.e. PENDING) claim per exact assertion
     # ------------------------------------------------------------------
+
+    def _assertion_key(
+        self, chain: str, tx: str, event_type: str, contract_address: str,
+        expected_from: str, expected_to: str, expected_token_id: str, expected_amount: str,
+    ) -> str:
+        # Folds every asserted field into the identity, not just (chain, tx) -- see header comment
+        # for why. Each field is length-prefixed before joining so that no arrangement of
+        # caller-controlled field contents (expected_token_id / expected_amount are free-form) can
+        # be reshuffled across a field boundary to collide with a different assertion's encoding,
+        # and the whole payload is then collapsed with SHA-256, which is second-preimage resistant,
+        # so a griefer cannot feasibly search for a different field combination that targets the
+        # same key as a specific real assertion.
+        fields = (
+            chain, tx, event_type, contract_address, expected_from, expected_to,
+            expected_token_id, expected_amount,
+        )
+        payload = "".join(f"{len(f)}:{f}" for f in fields)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+        return f"{chain}:{tx}:{digest}"
 
     @gl.public.write.payable
     def submit_claim(
@@ -180,17 +228,32 @@ class CrossChainEventCorroborator(gl.Contract):
         self._require_hex_address_or_empty(contract_address, "contract_address")
         self._require_hex_address_or_empty(expected_from, "expected_from")
         self._require_hex_address_or_empty(expected_to, "expected_to")
+        # Normalized to lowercase (like chain/tx above) so that two submissions asserting the same
+        # address in different letter-casing are recognized as the same assertion rather than
+        # silently forking into two independent, uncoordinated claim tracks.
+        contract_address = contract_address.lower()
+        expected_from = expected_from.lower()
+        expected_to = expected_to.lower()
         if len(expected_token_id) > 100:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} expected_token_id is too long")
         if len(expected_amount) > 100:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} expected_amount is too long")
 
-        claim_id = f"{chain}:{tx}"
-        if claim_id in self.claims:
-            raise gl.vm.UserError(
-                f"{ERROR_EXPECTED} A claim already exists for this chain/tx_hash; "
-                f"call add_bounty or request_corroboration instead"
-            )
+        assertion_key = self._assertion_key(
+            chain, tx, event_type, contract_address, expected_from, expected_to,
+            expected_token_id, expected_amount,
+        )
+        attempt = self.assertion_attempts[assertion_key] if assertion_key in self.assertion_attempts else u256(0)
+        if attempt > u256(0):
+            prior_claim_id = f"{assertion_key}#{int(attempt) - 1}"
+            prior = self.claims[prior_claim_id]
+            if prior.status == STATUS_PENDING:
+                raise gl.vm.UserError(
+                    f"{ERROR_EXPECTED} An identical claim is already PENDING as {prior_claim_id}; "
+                    f"call add_bounty or request_corroboration on it instead"
+                )
+        claim_id = f"{assertion_key}#{int(attempt)}"
+
         now = self._now()
         if now == "":
             raise gl.vm.UserError(f"{ERROR_TRANSIENT} Contract clock unavailable, retry")
@@ -205,6 +268,7 @@ class CrossChainEventCorroborator(gl.Contract):
             confirmed_at="", rejected_at="",
         )
         self.claim_ids.append(claim_id)
+        self.assertion_attempts[assertion_key] = attempt + u256(1)
         return claim_id
 
     @gl.public.write.payable
@@ -266,12 +330,16 @@ class CrossChainEventCorroborator(gl.Contract):
         return "INSUFFICIENT"
 
     @gl.public.write
-    def refund_stale_bounty(self, claim_id: str) -> None:
-        """Permissionless: anyone may trigger the refund, but funds only ever go to the original
-        submitter -- nobody 'solved' a STALE claim, so no keeper reward applies here."""
+    def refund_remaining_bounty(self, claim_id: str) -> None:
+        """Permissionless: anyone may trigger this once a claim has reached ANY terminal status.
+        Funds only ever go to the original submitter. A STALE claim never paid a keeper, so its
+        entire bounty is refunded here. A CONFIRMED or REJECTED claim already paid its keeper up
+        to KEEPER_REWARD_CAP_WEI in `_pay_keeper_if_affordable`; whatever bounty remains above that
+        cap is refunded here too, so no amount is ever permanently stuck in the contract regardless
+        of which terminal outcome a claim reaches."""
         claim = self._require_claim(claim_id)
-        if claim.status != STATUS_STALE:
-            raise gl.vm.UserError(f"{ERROR_EXPECTED} Only a STALE claim's bounty can be refunded")
+        if claim.status not in TERMINAL_STATUSES:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Only a terminal claim's remaining bounty can be refunded")
         if claim.bounty == u256(0):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} This claim has no bounty left to refund")
         amount = claim.bounty
